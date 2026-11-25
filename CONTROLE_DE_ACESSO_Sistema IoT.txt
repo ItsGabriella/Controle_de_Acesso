@@ -1,248 +1,165 @@
-// CONTROLE DE ACESSO - Sistema IoT (SENAI Norte)
-// Gabriella Galdino e Julia de Andrade Schoepping
-// Arduino UNO, HC-SR04, microservo, buzzer, LCD 16x2 I2C,
-// LED verde, LED vermelho (resistores de 220 ohm) e push-button.
+// CONTROLE DE ACESSO POR SENHA - Sistema IoT (SENAI Norte)
+
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <Servo.h>
+#include <Keypad.h>
+
+// ---------- Configuracao ----------
+const char SENHA[] = "1826"; 
+const byte TAMANHO_SENHA = 4;
+const byte MAX_TENTATIVAS = 3;
+const unsigned long TEMPO_ABERTO_MS = 5000;
+const unsigned long TEMPO_NEGADO_MS = 2000;
+const unsigned long TEMPO_BLOQUEIO_MS = 10000;
+const unsigned long TEMPO_DIGITACAO_MS = 10000; // apaga senha incompleta
+const int ANGULO_FECHADO = 0;
+const int ANGULO_ABERTO = 90;
 
 // ---------- Pinos ----------
-const byte PINO_BOTAO = 2;
 const byte PINO_LED_VERDE = 4;
 const byte PINO_LED_VERMELHO = 5;
 const byte PINO_SERVO = 6;
 const byte PINO_BUZZER = 8;
-const byte PINO_TRIG = 9;
-const byte PINO_ECHO = 10;
 // LCD I2C: SDA = A4, SCL = A5
 
-// ---------- Parametros configuraveis ----------
-const int DIST_LIMITE_CM = 20;
-const byte LEITURAS_CONFIRMACAO = 3;
-const unsigned long INTERVALO_LEITURA_MS = 60;
-const unsigned long TEMPO_ALERTA_MS = 5000;
-const unsigned long TEMPO_ALERTA_AUTORIZADO_MS = 10000;
-const unsigned long TEMPO_NORMALIZACAO_MS = 1500;
-const unsigned long TEMPO_MIN_ABERTO_MS = 3000;
-const int ANGULO_FECHADO = 0;
-const int ANGULO_ABERTO = 90;
+// ---------- Teclado ----------
+const byte LINHAS = 4;
+const byte COLUNAS = 4;
+char teclas[LINHAS][COLUNAS] = {
+{'1', '2', '3', 'A'},
+{'4', '5', '6', 'B'},
+{'7', '8', '9', 'C'},
+{'*', '0', '#', 'D'}
+};
+byte pinosLinhas[LINHAS] = {13, 12, 11, 10}; // L1, L2, L3, L4
+byte pinosColunas[COLUNAS] = {9, 7, 3, 2}; // C1, C2, C3, C4
+Keypad teclado = Keypad(makeKeymap(teclas), pinosLinhas, pinosColunas, LINHAS, COLUNAS);
 
-const unsigned long DEBOUNCE_MS = 50;
-const unsigned long TIMEOUT_ECO_US = 25000; // espera maxima pelo eco
-const unsigned int FREQ_ALARME_HZ = 2000;
-
-// Endereco 0x20 (32) no Tinkercad. LCD fisico: geralmente 0x27 ou 0x3F.
 LiquidCrystal_I2C lcd(0x20, 16, 2);
 Servo cancela;
 
 // ---------- Estados ----------
-enum Estado { FECHADO, ACESSO, ALERTA };
+enum Estado { FECHADO, LIBERADO, NEGADO, BLOQUEADO };
 Estado estado = FECHADO;
 
-unsigned long ultimaLeitura = 0;
-unsigned long inicioAbertura = 0;
-unsigned long inicioPresenca = 0;
-unsigned long ultimaPresenca = 0;
-byte leiturasSeguidas = 0;
-bool presencaConfirmada = false;
-bool presencaEmCurso = false;
-bool autorizado = false; // liberacao pelo botao neste ciclo
-unsigned int totalEventos = 0;
+char digitado[TAMANHO_SENHA + 1] = "";
+byte quantidade = 0;
+byte erros = 0;
+unsigned long inicioEstado = 0;
+unsigned long ultimaTecla = 0;
 
-bool leituraAnterior = HIGH;
-bool botaoEstavel = HIGH;
-unsigned long mudancaBotao = 0;
-
-char linhaAtual[2][17] = {"", ""};
-
-// ---------- LCD (so reescreve quando o texto muda) ----------
-void escreverLinha(byte linha, const char* texto) {
-char buf[17];
-snprintf(buf, sizeof(buf), "%-16s", texto);
-if (strcmp(buf, linhaAtual[linha]) != 0) {
-lcd.setCursor(0, linha);
-lcd.print(buf);
-strcpy(linhaAtual[linha], buf);
-}
+void mostrar(const char* linha1, const char* linha2) {
+lcd.clear();
+lcd.setCursor(0, 0);
+lcd.print(linha1);
+lcd.setCursor(0, 1);
+lcd.print(linha2);
 }
 
-unsigned long limiteAlerta() {
-return autorizado ? TEMPO_ALERTA_AUTORIZADO_MS : TEMPO_ALERTA_MS;
+void mostrarDigitacao() {
+char mascara[TAMANHO_SENHA + 1];
+for (byte i = 0; i < quantidade; i++) mascara[i] = '*';
+mascara[quantidade] = '\0';
+mostrar("Digite a senha:", mascara);
 }
 
-void atualizarLCD(unsigned long agora) {
-char texto[17];
-
-if (estado == FECHADO) {
-escreverLinha(0, "Acesso Fechado");
-snprintf(texto, sizeof(texto), "Eventos: %u", totalEventos);
-escreverLinha(1, texto);
-} else if (estado == ACESSO) {
-escreverLinha(0, autorizado ? "Cracha Liberado" : "Acesso Detectado");
-if (presencaEmCurso) {
-unsigned long decorrido = agora - inicioPresenca;
-unsigned long restante = 0;
-if (decorrido < limiteAlerta()) {
-restante = (limiteAlerta() - decorrido + 999) / 1000;
-}
-snprintf(texto, sizeof(texto), "Alerta em: %lus", restante);
-} else {
-snprintf(texto, sizeof(texto), "Evento: %u", totalEventos);
-}
-escreverLinha(1, texto);
-} else {
-escreverLinha(0, "ALERTA:");
-escreverLinha(1, "PORTA ABERTA!");
-}
+void limparSenha() {
+quantidade = 0;
+digitado[0] = '\0';
 }
 
-// ---------- Registro na porta serial ----------
-void registrarEvento(const char* descricao) {
-Serial.print("[");
-Serial.print(millis());
-Serial.print(" ms] Evento ");
-Serial.print(totalEventos);
-Serial.print(": ");
-Serial.println(descricao);
-}
-
-// ---------- Mudanca de estado ----------
-void mudarEstado(byte novo, unsigned long agora) {
+void mudarEstado(byte novo) {
 estado = (Estado)novo;
-
-if (estado == FECHADO) {
+inicioEstado = millis();
+limparSenha();
 noTone(PINO_BUZZER);
-cancela.write(ANGULO_FECHADO);
-digitalWrite(PINO_LED_VERDE, LOW);
-digitalWrite(PINO_LED_VERMELHO, HIGH);
-autorizado = false;
-presencaEmCurso = false;
-registrarEvento("FECHADO");
-} else if (estado == ACESSO) {
-totalEventos++;
-inicioAbertura = agora;
-ultimaPresenca = agora;
-cancela.write(ANGULO_ABERTO);
-digitalWrite(PINO_LED_VERDE, HIGH);
-digitalWrite(PINO_LED_VERMELHO, LOW);
-registrarEvento(autorizado ? "ACESSO (cracha)" : "ACESSO (sensor)");
-} else {
-tone(PINO_BUZZER, FREQ_ALARME_HZ); // alarme continuo
-digitalWrite(PINO_LED_VERDE, LOW);
-digitalWrite(PINO_LED_VERMELHO, HIGH);
-registrarEvento("ALERTA: PORTA ABERTA!");
-}
+digitalWrite(PINO_LED_VERDE, estado == LIBERADO ? HIGH : LOW);
+digitalWrite(PINO_LED_VERMELHO, estado == LIBERADO ? LOW : HIGH);
+cancela.write(estado == LIBERADO ? ANGULO_ABERTO : ANGULO_FECHADO);
 
-atualizarLCD(agora);
-}
-
-// ---------- Sensor ----------
-long lerDistancia() {
-digitalWrite(PINO_TRIG, LOW);
-delayMicroseconds(2);
-digitalWrite(PINO_TRIG, HIGH);
-delayMicroseconds(10);
-digitalWrite(PINO_TRIG, LOW);
-unsigned long duracao = pulseIn(PINO_ECHO, HIGH, TIMEOUT_ECO_US);
-if (duracao == 0) return -1; // sem eco
-return duracao * 0.034 / 2;
-}
-
-// Confirma presenca apos leituras consecutivas abaixo do limite
-void lerSensor() {
-long distancia = lerDistancia();
-if (distancia >= 0 && distancia < DIST_LIMITE_CM) {
-if (leiturasSeguidas < LEITURAS_CONFIRMACAO) leiturasSeguidas++;
-} else {
-leiturasSeguidas = 0;
-}
-presencaConfirmada = (leiturasSeguidas >= LEITURAS_CONFIRMACAO);
-}
-
-// ---------- Botao (cracha) ----------
-bool botaoPressionado(unsigned long agora) {
-bool leitura = digitalRead(PINO_BOTAO); // apertado = LOW
-if (leitura != leituraAnterior) {
-mudancaBotao = agora;
-leituraAnterior = leitura;
-}
-if (agora - mudancaBotao >= DEBOUNCE_MS && leitura != botaoEstavel) {
-botaoEstavel = leitura;
-return botaoEstavel == LOW;
-}
-return false;
-}
-
-void tratarBotao(unsigned long agora) {
 if (estado == FECHADO) {
-autorizado = true;
-mudarEstado(ACESSO, agora);
-} else if (estado == ACESSO && !autorizado) {
-autorizado = true;
-registrarEvento("Cracha: tempo estendido");
+mostrarDigitacao();
+Serial.print("Aguardando senha");
+} else if (estado == LIBERADO) {
+mostrar("Acesso liberado", "");
+tone(PINO_BUZZER, 1500, 200); // bip de confirmacao
+Serial.print("Acesso liberado");
+} else if (estado == NEGADO) {
+mostrar("Acesso nao", "liberado");
+tone(PINO_BUZZER, 400, 600); // som de erro
+Serial.print("Senha incorreta");
+} else {
+mostrar("ALERTA:", "BLOQUEADO");
+tone(PINO_BUZZER, 2000); // alarme continuo
+Serial.print("ALERTA: sistema bloqueado");
 }
-// No estado ALERTA o botao e ignorado
-}
-
-// ---------- Logica ----------
-void atualizarEstado(unsigned long agora) {
-if (estado == FECHADO) {
-if (!presencaConfirmada) return;
-mudarEstado(ACESSO, agora);
-}
-
-if (presencaConfirmada) {
-ultimaPresenca = agora;
-if (!presencaEmCurso) {
-presencaEmCurso = true;
-inicioPresenca = agora;
-}
+Serial.print(" - ms: ");
+Serial.println(inicioEstado);
 }
 
-bool normalizado = !presencaConfirmada &&
-agora - ultimaPresenca >= TEMPO_NORMALIZACAO_MS;
-
-if (estado == ACESSO) {
-if (normalizado) {
-presencaEmCurso = false;
-if (agora - inicioAbertura >= TEMPO_MIN_ABERTO_MS) {
-mudarEstado(FECHADO, agora);
-}
-} else if (presencaConfirmada && agora - inicioPresenca >= limiteAlerta()) {
-mudarEstado(ALERTA, agora);
-}
-} else if (estado == ALERTA && normalizado) {
-mudarEstado(FECHADO, agora);
+void conferirSenha() {
+if (strcmp(digitado, SENHA) == 0) {
+erros = 0;
+mudarEstado(LIBERADO);
+} else {
+erros++;
+if (erros >= MAX_TENTATIVAS) mudarEstado(BLOQUEADO);
+else mudarEstado(NEGADO);
 }
 }
 
-// ---------- Setup / Loop ----------
+// # confirma, * apaga
+void tratarTecla(char tecla) {
+if (tecla >= '0' && tecla <= '9') {
+if (quantidade < TAMANHO_SENHA) {
+digitado[quantidade++] = tecla;
+digitado[quantidade] = '\0';
+}
+} else if (tecla == '*') {
+limparSenha();
+} else if (tecla == '#') {
+if (quantidade > 0) {
+conferirSenha();
+return;
+}
+} else {
+return; // A, B, C e D nao sao usadas
+}
+ultimaTecla = millis();
+tone(PINO_BUZZER, 1000, 50); // bip da tecla
+mostrarDigitacao();
+}
+
 void setup() {
 Serial.begin(9600);
-pinMode(PINO_TRIG, OUTPUT);
-pinMode(PINO_ECHO, INPUT);
 pinMode(PINO_BUZZER, OUTPUT);
 pinMode(PINO_LED_VERDE, OUTPUT);
 pinMode(PINO_LED_VERMELHO, OUTPUT);
-pinMode(PINO_BOTAO, INPUT_PULLUP);
-
 cancela.attach(PINO_SERVO);
 lcd.init();
 lcd.backlight();
-
-mudarEstado(FECHADO, millis());
+mudarEstado(FECHADO);
 }
 
 void loop() {
+char tecla = teclado.getKey();
 unsigned long agora = millis();
 
-if (botaoPressionado(agora)) tratarBotao(agora);
-
-if (agora - ultimaLeitura >= INTERVALO_LEITURA_MS) {
-ultimaLeitura = agora;
-lerSensor();
-atualizarEstado(agora);
-atualizarLCD(agora);
+if (estado == FECHADO) {
+if (tecla) {
+tratarTecla(tecla);
+} else if (quantidade > 0 && agora - ultimaTecla >= TEMPO_DIGITACAO_MS) {
+limparSenha();
+mostrarDigitacao();
+}
+} else if (estado == LIBERADO && agora - inicioEstado >= TEMPO_ABERTO_MS) {
+mudarEstado(FECHADO);
+} else if (estado == NEGADO && agora - inicioEstado >= TEMPO_NEGADO_MS) {
+mudarEstado(FECHADO);
+} else if (estado == BLOQUEADO && agora - inicioEstado >= TEMPO_BLOQUEIO_MS) {
+erros = 0;
+mudarEstado(FECHADO);
 }
 }

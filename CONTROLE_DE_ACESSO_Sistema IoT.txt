@@ -1,42 +1,42 @@
-// CONTROLE DE ACESSO POR SENHA - Sistema IoT (SENAI Norte)
-
-
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <Servo.h>
 #include <Keypad.h>
+#include <EEPROM.h>
 
 // ---------- Configuracao ----------
-const char SENHA[] = "1826"; 
+const char SENHA[] = "1826";
 const byte TAMANHO_SENHA = 4;
 const byte MAX_TENTATIVAS = 3;
 const unsigned long TEMPO_ABERTO_MS = 5000;
 const unsigned long TEMPO_NEGADO_MS = 2000;
-const unsigned long TEMPO_BLOQUEIO_MS = 10000;
 const unsigned long TEMPO_DIGITACAO_MS = 10000; // apaga senha incompleta
 const int ANGULO_FECHADO = 0;
 const int ANGULO_ABERTO = 90;
+
+// Bloqueio progressivo
+const unsigned long TEMPOS_BLOQUEIO_MS[] = {10000UL, 30000UL, 60000UL};
 
 // ---------- Pinos ----------
 const byte PINO_LED_VERDE = 4;
 const byte PINO_LED_VERMELHO = 5;
 const byte PINO_SERVO = 6;
 const byte PINO_BUZZER = 8;
-// LCD I2C: SDA = A4, SCL = A5
 
 // ---------- Teclado ----------
 const byte LINHAS = 4;
 const byte COLUNAS = 4;
 char teclas[LINHAS][COLUNAS] = {
-{'1', '2', '3', 'A'},
-{'4', '5', '6', 'B'},
-{'7', '8', '9', 'C'},
-{'*', '0', '#', 'D'}
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
 };
 byte pinosLinhas[LINHAS] = {13, 12, 11, 10}; // L1, L2, L3, L4
-byte pinosColunas[COLUNAS] = {9, 7, 3, 2}; // C1, C2, C3, C4
+byte pinosColunas[COLUNAS] = {9, 7, 3, 2};   // C1, C2, C3, C4
 Keypad teclado = Keypad(makeKeymap(teclas), pinosLinhas, pinosColunas, LINHAS, COLUNAS);
 
+// Endereco 0x20 (32) no Tinkercad. LCD fisico: geralmente 0x27 ou 0x3F.
 LiquidCrystal_I2C lcd(0x20, 16, 2);
 Servo cancela;
 
@@ -47,119 +47,238 @@ Estado estado = FECHADO;
 char digitado[TAMANHO_SENHA + 1] = "";
 byte quantidade = 0;
 byte erros = 0;
+byte nivelBloqueio = 0;                 // quantos bloqueios seguidos ja ocorreram
+bool alarmeAtivo = false;               // true = buzzer tocando ate acertar a senha
+unsigned long tempoBloqueioAtual = 0;
+int ultimoRestante = -1;
 unsigned long inicioEstado = 0;
 unsigned long ultimaTecla = 0;
 
+// ---------- HISTORICO NA EEPROM ----------
+const byte MAX_REGISTROS = 100;
+const int INICIO_REGISTROS = 2;
+const byte TAM_REGISTRO = 5;
+
+void registrar(byte resultado) {
+  byte pos = EEPROM.read(0);
+  byte total = EEPROM.read(1);
+  if (pos >= MAX_REGISTROS) pos = 0;
+  if (total > MAX_REGISTROS) total = 0;
+
+  uint32_t segundos = millis() / 1000;
+  int endereco = INICIO_REGISTROS + pos * TAM_REGISTRO;
+  EEPROM.put(endereco, segundos);
+  EEPROM.update(endereco + 4, resultado);
+
+  pos = (pos + 1) % MAX_REGISTROS;
+  if (total < MAX_REGISTROS) total++;
+  EEPROM.update(0, pos);
+  EEPROM.update(1, total);
+}
+
+void mostrarHistorico() {
+  byte pos = EEPROM.read(0);
+  byte total = EEPROM.read(1);
+  if (total == 0 || total > MAX_REGISTROS || pos >= MAX_REGISTROS) {
+    Serial.println(F("Historico vazio."));
+    return;
+  }
+  Serial.println(F("--- HISTORICO (mais recente primeiro) ---"));
+  for (byte i = 1; i <= total; i++) {
+    int idx = ((int)pos - i + MAX_REGISTROS) % MAX_REGISTROS;
+    int endereco = INICIO_REGISTROS + idx * TAM_REGISTRO;
+    uint32_t t;
+    EEPROM.get(endereco, t);
+    byte res = EEPROM.read(endereco + 4);
+
+    char buf[16];
+    sprintf(buf, "%02lu:%02lu:%02lu", t / 3600UL, (t / 60UL) % 60UL, t % 60UL);
+    Serial.print(buf);
+    if (res == 1) Serial.println(F("  ACESSO LIBERADO"));
+    else if (res == 2) Serial.println(F("  SENHA INCORRETA - BLOQUEIO"));
+    else Serial.println(F("  SENHA INCORRETA"));
+  }
+  Serial.println(F("-----------------------------------------"));
+}
+
+void limparHistorico() {
+  EEPROM.update(0, 0);
+  EEPROM.update(1, 0);
+  Serial.println(F("Historico apagado."));
+}
+
+void lerSerial() {
+  if (Serial.available()) {
+    char c = toupper(Serial.read());
+    if (c == 'H') mostrarHistorico();
+    else if (c == 'C') limparHistorico();
+  }
+}
+
+// ---------- Som ----------
+// Bipe curto que NAO interrompe o alarme quando ele esta ativo
+void bipar(unsigned int frequencia, unsigned long duracao) {
+  if (!alarmeAtivo) tone(PINO_BUZZER, frequencia, duracao);
+}
+
+// ---------- Display ----------
 void mostrar(const char* linha1, const char* linha2) {
-lcd.clear();
-lcd.setCursor(0, 0);
-lcd.print(linha1);
-lcd.setCursor(0, 1);
-lcd.print(linha2);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(linha1);
+  lcd.setCursor(0, 1);
+  lcd.print(linha2);
 }
 
 void mostrarDigitacao() {
-char mascara[TAMANHO_SENHA + 1];
-for (byte i = 0; i < quantidade; i++) mascara[i] = '*';
-mascara[quantidade] = '\0';
-mostrar("Digite a senha:", mascara);
+  char mascara[TAMANHO_SENHA + 1];
+  for (byte i = 0; i < quantidade; i++) mascara[i] = '*';
+  mascara[quantidade] = '\0';
+  mostrar(alarmeAtivo ? "ALARME! Senha:" : "Digite a senha:", mascara);
 }
 
 void limparSenha() {
-quantidade = 0;
-digitado[0] = '\0';
+  quantidade = 0;
+  digitado[0] = '\0';
 }
 
 void mudarEstado(byte novo) {
-estado = (Estado)novo;
-inicioEstado = millis();
-limparSenha();
-noTone(PINO_BUZZER);
-digitalWrite(PINO_LED_VERDE, estado == LIBERADO ? HIGH : LOW);
-digitalWrite(PINO_LED_VERMELHO, estado == LIBERADO ? LOW : HIGH);
-cancela.write(estado == LIBERADO ? ANGULO_ABERTO : ANGULO_FECHADO);
+  estado = (Estado)novo;
+  inicioEstado = millis();
+  limparSenha();
+  if (!alarmeAtivo) noTone(PINO_BUZZER); // se o alarme esta ativo, ele continua
+  digitalWrite(PINO_LED_VERDE, estado == LIBERADO ? HIGH : LOW);
+  digitalWrite(PINO_LED_VERMELHO, estado == LIBERADO ? LOW : HIGH);
+  cancela.write(estado == LIBERADO ? ANGULO_ABERTO : ANGULO_FECHADO);
 
-if (estado == FECHADO) {
-mostrarDigitacao();
-Serial.print("Aguardando senha");
-} else if (estado == LIBERADO) {
-mostrar("Acesso liberado", "");
-tone(PINO_BUZZER, 1500, 200); // bip de confirmacao
-Serial.print("Acesso liberado");
-} else if (estado == NEGADO) {
-mostrar("Acesso nao", "liberado");
-tone(PINO_BUZZER, 400, 600); // som de erro
-Serial.print("Senha incorreta");
-} else {
-mostrar("ALERTA:", "BLOQUEADO");
-tone(PINO_BUZZER, 2000); // alarme continuo
-Serial.print("ALERTA: sistema bloqueado");
-}
-Serial.print(" - ms: ");
-Serial.println(inicioEstado);
+  if (estado == FECHADO) {
+    mostrarDigitacao();
+    Serial.print("Aguardando senha");
+  } else if (estado == LIBERADO) {
+    mostrar("Acesso liberado", "Porta aberta");
+    tone(PINO_BUZZER, 1500, 200); // bip de confirmacao
+    Serial.print("Acesso liberado");
+  } else if (estado == NEGADO) {
+    if (alarmeAtivo) {
+      mostrar("Senha incorreta", "Alarme ativo");
+    } else {
+      char linha2[17];
+      snprintf(linha2, sizeof(linha2), "Tentativa %d/%d", erros, MAX_TENTATIVAS);
+      mostrar("Senha incorreta", linha2);
+    }
+    bipar(400, 600); // som de erro (so se nao houver alarme)
+    Serial.print("Senha incorreta");
+  } else {
+    // bloqueio progressivo: o tempo aumenta a cada bloqueio seguido
+    byte indice = nivelBloqueio;
+    if (indice > 2) indice = 2;
+    tempoBloqueioAtual = TEMPOS_BLOQUEIO_MS[indice];
+    nivelBloqueio++;
+    ultimoRestante = -1;
+    alarmeAtivo = true;          // alarme so para com a senha correta
+    mostrar("ALERTA:", "BLOQUEADO");
+    tone(PINO_BUZZER, 2000);     // alarme continuo
+    Serial.print("ALERTA: sistema bloqueado por ");
+    Serial.print(tempoBloqueioAtual / 1000);
+    Serial.print("s");
+  }
+  Serial.print(" - ms: ");
+  Serial.println(inicioEstado);
 }
 
 void conferirSenha() {
-if (strcmp(digitado, SENHA) == 0) {
-erros = 0;
-mudarEstado(LIBERADO);
-} else {
-erros++;
-if (erros >= MAX_TENTATIVAS) mudarEstado(BLOQUEADO);
-else mudarEstado(NEGADO);
-}
+  if (strcmp(digitado, SENHA) == 0) {
+    erros = 0;
+    nivelBloqueio = 0;     // acertou: zera o nivel de bloqueio
+    alarmeAtivo = false;   // acertou: desliga o alarme
+    registrar(1);
+    mudarEstado(LIBERADO);
+  } else {
+    erros++;
+    if (erros >= MAX_TENTATIVAS) {
+      registrar(2);
+      mudarEstado(BLOQUEADO);
+    } else {
+      registrar(0);
+      mudarEstado(NEGADO);
+    }
+  }
 }
 
-// # confirma, * apaga
+// # confirma, * apaga, A mostra o historico
 void tratarTecla(char tecla) {
-if (tecla >= '0' && tecla <= '9') {
-if (quantidade < TAMANHO_SENHA) {
-digitado[quantidade++] = tecla;
-digitado[quantidade] = '\0';
+  if (tecla >= '0' && tecla <= '9') {
+    if (quantidade < TAMANHO_SENHA) {
+      digitado[quantidade++] = tecla;
+      digitado[quantidade] = '\0';
+    }
+  } else if (tecla == '*') {
+    limparSenha();
+  } else if (tecla == '#') {
+    if (quantidade > 0) {
+      conferirSenha();
+      return;
+    }
+  } else if (tecla == 'A') {
+    mostrarHistorico();
+    return;
+  } else {
+    return; // B, C e D nao sao usadas
+  }
+  ultimaTecla = millis();
+  bipar(1000, 50); // bip da tecla (so se nao houver alarme)
+  mostrarDigitacao();
 }
-} else if (tecla == '*') {
-limparSenha();
-} else if (tecla == '#') {
-if (quantidade > 0) {
-conferirSenha();
-return;
-}
-} else {
-return; // A, B, C e D nao sao usadas
-}
-ultimaTecla = millis();
-tone(PINO_BUZZER, 1000, 50); // bip da tecla
-mostrarDigitacao();
+
+// Contagem regressiva na segunda linha durante o bloqueio
+void atualizarContagem(unsigned long agora) {
+  unsigned long decorrido = agora - inicioEstado;
+  if (decorrido >= tempoBloqueioAtual) return;
+  int restante = (tempoBloqueioAtual - decorrido + 999) / 1000;
+  if (restante != ultimoRestante) {
+    ultimoRestante = restante;
+    lcd.setCursor(0, 1);
+    lcd.print("Aguarde ");
+    lcd.print(restante);
+    lcd.print("s    ");
+  }
 }
 
 void setup() {
-Serial.begin(9600);
-pinMode(PINO_BUZZER, OUTPUT);
-pinMode(PINO_LED_VERDE, OUTPUT);
-pinMode(PINO_LED_VERMELHO, OUTPUT);
-cancela.attach(PINO_SERVO);
-lcd.init();
-lcd.backlight();
-mudarEstado(FECHADO);
+  Serial.begin(9600);
+  pinMode(PINO_BUZZER, OUTPUT);
+  pinMode(PINO_LED_VERDE, OUTPUT);
+  pinMode(PINO_LED_VERMELHO, OUTPUT);
+  cancela.attach(PINO_SERVO);
+  lcd.init();
+  lcd.backlight();
+
+  mudarEstado(FECHADO);
+  Serial.println(F("Digite H para ver o historico, C para apagar."));
 }
 
 void loop() {
-char tecla = teclado.getKey();
-unsigned long agora = millis();
+  char tecla = teclado.getKey();
+  unsigned long agora = millis();
+  lerSerial();
 
-if (estado == FECHADO) {
-if (tecla) {
-tratarTecla(tecla);
-} else if (quantidade > 0 && agora - ultimaTecla >= TEMPO_DIGITACAO_MS) {
-limparSenha();
-mostrarDigitacao();
-}
-} else if (estado == LIBERADO && agora - inicioEstado >= TEMPO_ABERTO_MS) {
-mudarEstado(FECHADO);
-} else if (estado == NEGADO && agora - inicioEstado >= TEMPO_NEGADO_MS) {
-mudarEstado(FECHADO);
-} else if (estado == BLOQUEADO && agora - inicioEstado >= TEMPO_BLOQUEIO_MS) {
-erros = 0;
-mudarEstado(FECHADO);
-}
+  if (estado == FECHADO) {
+    if (tecla) {
+      tratarTecla(tecla);
+    } else if (quantidade > 0 && agora - ultimaTecla >= TEMPO_DIGITACAO_MS) {
+      limparSenha();
+      mostrarDigitacao();
+    }
+  } else if (estado == LIBERADO && agora - inicioEstado >= TEMPO_ABERTO_MS) {
+    mudarEstado(FECHADO);
+  } else if (estado == NEGADO && agora - inicioEstado >= TEMPO_NEGADO_MS) {
+    mudarEstado(FECHADO);
+  } else if (estado == BLOQUEADO) {
+    if (agora - inicioEstado >= tempoBloqueioAtual) {
+      erros = 0;
+      mudarEstado(FECHADO); // o alarme continua tocando ate acertar a senha
+    } else {
+      atualizarContagem(agora);
+    }
+  }
 }
